@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-ClaimPrecedent Agent — LangGraph + OpenAI function-calling 기반 ReAct 구현 (v3)
+ClaimPrecedent Agent — LangGraph + OpenAI function-calling 기반 ReAct 구현
 
-v2 대비 변경점:
+변경점:
 1. web_search_tool 추가 — 신뢰 도메인(fss.or.kr, law.go.kr, kiri.or.kr)으로 제한된 웹검색.
    결과는 "외부참고자료"로만 취급되며 evidence_strength 산정에는 포함되지 않고,
    사용될 경우 근거강도와 무관하게 무조건 HITL이 발동함(risk_node에서 강제).
 2. CRAG 우회 방지 — case_id_validator가 "실제 검색된 사례인지"뿐 아니라
    "relevance_reranker를 실제로 통과한 사례인지"까지 검증하도록 강화.
-   (v2에서는 검색만 되고 재검증은 안 거친 사례를 LLM이 그냥 인용해도 걸러지지 않던 문제 수정)
+   (이전 버전에서는 검색만 되고 재검증은 안 거친 사례를 LLM이 그냥 인용해도 걸러지지 않던 문제 수정)
 
-가드레일(HITL/감사로그)은 v2와 동일하게 LLM 재량 밖에 둠.
+가드레일(HITL/감사로그)은 이전 버전과 동일하게 LLM 재량 밖에 둠.
 """
 import os
 import json
@@ -32,16 +32,16 @@ load_dotenv(Path(__file__).parent / ".env")
 
 EMBED_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
-MAX_ITERATIONS = 8          # ReAct 루프 최대 tool-call 왕복 횟수 (웹검색 추가로 v2(6)에서 상향)
+MAX_ITERATIONS = 8          # ReAct 루프 최대 tool-call 왕복 횟수 (웹검색 추가)
 HIGH_EVIDENCE_COUNT = 3
-# v5: 조기 기권(결정론적 가드레일) — 12장 실측에서 코퍼스 무관 쟁점이 8회를 모두 소진하며
+# 조기 기권(규칙 기반 가드레일) — 실측에서 코퍼스 무관 쟁점이 8회를 모두 소진하며
 # 재검색만 반복하는 비효율(latency·토큰 약 2배)이 확인되어 추가. 아래 두 조건을 모두 시도하고도
 # 재검증 통과 사례가 누적 0건이고 웹 외부자료도 없으면, MAX_ITERATIONS를 기다리지 않고 즉시 기권 종료.
 EARLY_ABSTAIN_MIN_SEARCHES = 3   # vector_search_tool 최소 시도 횟수 (검색어 재구성 기회 보장)
 EARLY_ABSTAIN_MIN_RERANKS = 2    # relevance_reranker 최소 시도 횟수
 TRUSTED_WEB_DOMAINS = ["fss.or.kr", "law.go.kr", "kiri.or.kr"]  # 웹검색 허용 도메인 (금감원/법령정보센터/보험연구원)
 
-# 12장 token cost 지표용 단가 (2026-07 기준 gpt-4o-mini / text-embedding-3-small, USD per token)
+# token cost 지표용 단가 (2026-07 기준 gpt-4o-mini / text-embedding-3-small, USD per token)
 CHAT_INPUT_RATE = 0.15 / 1_000_000
 CHAT_OUTPUT_RATE = 0.60 / 1_000_000
 EMBEDDING_RATE = 0.02 / 1_000_000
@@ -52,6 +52,7 @@ def get_client() -> OpenAI:
 
 
 def get_conn():
+# PostgreSQL 커넥션 생성 — 판례 코퍼스 조회 및 감사로그 기록에 공용 사용.
     return psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "localhost"),
         port=os.environ.get("POSTGRES_PORT", "5432"),
@@ -60,14 +61,15 @@ def get_conn():
         password=os.environ["POSTGRES_PASSWORD"],
     )
 
-
+# AgentState — LangGraph 노드들이 주고받는 공유 상태
+# react가 채우고, risk가 판정을 더하고, hitl이 사람 결정을 더하고, log가 DB에 기록
 class AgentState(TypedDict, total=False):
     input_query: str
     product_type: Optional[str]
     extracted_issue: str
     retrieved_cases: List[Dict[str, Any]]
     filtered_cases: List[Dict[str, Any]]
-    external_references: List[Dict[str, Any]]   # 웹검색으로 얻은 외부참고자료 (evidence_strength에 미반영)
+    external_references: List[Dict[str, Any]]   # 웹검색으로 얻은 외부참고자료 
     tool_call_trace: List[Dict[str, Any]]
     evidence_strength: Literal["LOW", "MEDIUM", "HIGH"]
     recommendation: Literal["APPROVE", "DENY", "ADDITIONAL_REVIEW_NEEDED"]
@@ -76,7 +78,7 @@ class AgentState(TypedDict, total=False):
     hitl_reason: Optional[str]
     human_decision: Optional[str]
     human_note: Optional[str]
-    # --- 12장 평가지표(환각율/task달성률/latency/token cost)용 신규 필드 ---
+    # --- 평가지표(환각율/task달성률/latency/token cost)용 신규 필드 ---
     loop_completed: bool
     hallucinated_case_ids: List[str]
     not_reranked_case_ids: List[str]
@@ -89,7 +91,7 @@ class AgentState(TypedDict, total=False):
 
 
 # ---------------------------------------------------------------------------
-# Tool 스키마 (OpenAI function-calling) — report 9.4 Tool 목록 + web_search_tool 확장
+# Tool 스키마 (OpenAI function-calling) — Tool 목록 + web_search_tool 확장
 # ---------------------------------------------------------------------------
 
 TOOLS = [
@@ -238,26 +240,33 @@ evidence_strength_scorer, web_search_tool, finalize_opinion.
 # Tool 실행부 (실제 DB/재검증/외부검색 로직)
 # ---------------------------------------------------------------------------
 
+# ToolContext — 한 번의 react 루프 실행 동안 tool들이 공유하는 작업 메모리
+# seen_cases(검색으로 실제 확인된 사례), reranked_relevant(재검증 통과 사례),
+# trace(호출 이력), 토큰/시도 카운터 등을 보관. case_id_validator의 이중검증과
+# 조기 기권 판정이 모두 이 컨텍스트의 기록에 근거한다.
 class ToolContext:
     def __init__(self):
         self.seen_cases: Dict[str, Dict[str, Any]] = {}       # 실제 DB에서 검색된 사례만 등록
         self.reranked_relevant: set = set()                    # relevance_reranker를 통과한 case_id만 등록
         self.web_sources: List[Dict[str, Any]] = []            # web_search_tool로 얻은 외부참고자료
         self.trace: List[Dict[str, Any]] = []
-        # --- 12장 token cost 지표용 누적 카운터 ---
+        # --- token cost 지표용 누적 카운터 ---
         self.chat_input_tokens: int = 0
         self.chat_output_tokens: int = 0
         self.embedding_tokens: int = 0
-        # --- v5 조기 기권 가드레일용 시도 카운터 ---
+        # --- 조기 기권 가드레일용 시도 카운터 ---
         self.search_count: int = 0                             # vector_search_tool 호출 횟수
         self.rerank_count: int = 0                             # relevance_reranker 호출 횟수
 
 
+# Tool 실행 함수 5종 — react 루프에서 LLM의 function calling으로 호출된다
 def exec_vector_search_tool(ctx: ToolContext, query: str, top_k: int = 5) -> Dict[str, Any]:
-    ctx.search_count += 1                                # v5 조기 기권 가드레일용
+# pgvector 유사 판례 검색: 검색어를 임베딩해 코사인 유사도 상위 top_k건 반환.
+# 검색된 사례는 ctx.seen_cases에 등록되어 이후 인용 검증의 근거가 된다.
+    ctx.search_count += 1                                # 조기 기권 가드레일용
     client = get_client()
     emb_resp = client.embeddings.create(model=EMBED_MODEL, input=[query])
-    ctx.embedding_tokens += emb_resp.usage.total_tokens  # 12장 token cost 지표용
+    ctx.embedding_tokens += emb_resp.usage.total_tokens  # token cost 지표용
     emb = emb_resp.data[0].embedding
 
     conn = get_conn()
@@ -290,7 +299,9 @@ def exec_vector_search_tool(ctx: ToolContext, query: str, top_k: int = 5) -> Dic
 
 
 def exec_relevance_reranker(ctx: ToolContext, issue: str, candidate_case_ids: List[str]) -> Dict[str, Any]:
-    ctx.rerank_count += 1                                # v5 조기 기권 가드레일용
+# CRAG 방식 관련성 재검증: 벡터 유사도 상위 후보를 '쟁점이 실제로 관련 있는가'
+# 기준으로 LLM이 재판정. 통과 사례만 ctx.reranked_relevant에 등록 → 근거강도 산정의 분모.
+    ctx.rerank_count += 1                                # 조기 기권 가드레일용
     candidates = [ctx.seen_cases[cid] for cid in candidate_case_ids if cid in ctx.seen_cases]
     if not candidates:
         return {"relevant_case_ids": []}
@@ -312,8 +323,8 @@ def exec_relevance_reranker(ctx: ToolContext, issue: str, candidate_case_ids: Li
         temperature=0,
         response_format={"type": "json_object"},
     )
-    ctx.chat_input_tokens += resp.usage.prompt_tokens        # 12장 token cost 지표용
-    ctx.chat_output_tokens += resp.usage.completion_tokens   # 12장 token cost 지표용
+    ctx.chat_input_tokens += resp.usage.prompt_tokens        # token cost 지표용
+    ctx.chat_output_tokens += resp.usage.completion_tokens   # token cost 지표용
     try:
         relevant = json.loads(resp.choices[0].message.content).get("relevant_case_ids", [])
     except (json.JSONDecodeError, AttributeError):
@@ -329,6 +340,8 @@ def exec_relevance_reranker(ctx: ToolContext, issue: str, candidate_case_ids: Li
 
 
 def exec_case_id_validator(ctx: ToolContext, case_ids: List[str]) -> Dict[str, Any]:
+# 인용 이중검증(환각 방지 핵심): LLM이 인용한 case_id가 (1)실제 검색됐고
+# (2)재검증을 통과했는지를 서버 측 기록(ctx)으로 독립 확인. LLM 자기신고는 불신.
     valid, invalid_hallucinated, invalid_not_reranked = [], [], []
     for cid in case_ids:
         if cid not in ctx.seen_cases:
@@ -346,12 +359,15 @@ def exec_case_id_validator(ctx: ToolContext, case_ids: List[str]) -> Dict[str, A
 
 
 def exec_evidence_strength_scorer(relevant_case_ids: List[str]) -> Dict[str, Any]:
+# 근거강도 산정: 재검증 통과 사례 수 기준 HIGH(3+)/MEDIUM(2)/LOW(0~1).
     n = len(relevant_case_ids)
     strength = "LOW" if n == 0 else ("HIGH" if n >= HIGH_EVIDENCE_COUNT else "MEDIUM")
     return {"evidence_strength": strength, "relevant_case_count": n}
 
 
 def exec_web_search_tool(ctx: ToolContext, query: str) -> Dict[str, Any]:
+# 외부 웹검색(신뢰 도메인 3곳 제한): 결과는 근거강도에 미반영되며,
+# 하나라도 사용되면 risk 노드에서 HITL이 강제된다.
     api_key = os.environ.get("SERPER_API_KEY")
     if not api_key:
         return {"error": "SERPER_API_KEY가 설정되지 않아 웹검색을 사용할 수 없습니다."}
@@ -396,11 +412,16 @@ TOOL_EXECUTORS = {
 # ReAct 루프 노드
 # ---------------------------------------------------------------------------
 
+# LangGraph 노드 4종: react(자율) → risk → hitl → log(이상 규칙 기반 가드레일)
 def react_node(state: AgentState) -> AgentState:
+    """자율 Tool-calling ReAct 루프.
+    LLM이 tool 호출 순서·횟수를 스스로 결정(최대 MAX_ITERATIONS회)하며,
+    finalize_opinion 호출 시 정상 종료. 근거 불충분 시 검색어를 재구성해 재검색한다.
+    검색 3회+재검증 2회에도 통과 0건이면 조기 기권(규칙 기반 가드레일)."""
     client = get_client()
     ctx = ToolContext()
-    t_start = time.monotonic()               # 12장 avg latency 지표용
-    first_response_latency: Optional[float] = None   # 12장 avg latency 지표용 (첫 LLM 응답까지)
+    t_start = time.monotonic()               # avg latency 지표용
+    first_response_latency: Optional[float] = None   # avg latency 지표용 (첫 LLM 응답까지)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -410,15 +431,15 @@ def react_node(state: AgentState) -> AgentState:
     ]
 
     final_args: Optional[Dict[str, Any]] = None
-    early_abstain = False                                # v5 조기 기권 가드레일
+    early_abstain = False                                # 조기 기권 가드레일
 
     for step in range(MAX_ITERATIONS):
         resp = client.chat.completions.create(
             model=LLM_MODEL, messages=messages, tools=TOOLS, tool_choice="auto", temperature=0,
         )
-        ctx.chat_input_tokens += resp.usage.prompt_tokens        # 12장 token cost 지표용
-        ctx.chat_output_tokens += resp.usage.completion_tokens   # 12장 token cost 지표용
-        if first_response_latency is None:                       # 12장 avg latency 지표용
+        ctx.chat_input_tokens += resp.usage.prompt_tokens        # token cost 지표용
+        ctx.chat_output_tokens += resp.usage.completion_tokens   # token cost 지표용
+        if first_response_latency is None:                       # avg latency 지표용
             first_response_latency = time.monotonic() - t_start
         msg = resp.choices[0].message
 
@@ -461,7 +482,7 @@ def react_node(state: AgentState) -> AgentState:
         if stop:
             break
 
-        # --- v5 조기 기권 (결정론적 가드레일, LLM 재량 밖) ---
+        # --- 조기 기권 (규칙 기반 가드레일, LLM 재량 밖) ---
         # 검색어를 바꿔가며 충분히 시도했는데도 관련성 재검증 통과 사례가 누적 0건이고
         # 웹 외부자료도 없으면, 남은 반복은 재검색만 반복될 뿐이므로 즉시 기권 종료한다.
         if (ctx.search_count >= EARLY_ABSTAIN_MIN_SEARCHES
@@ -478,7 +499,7 @@ def react_node(state: AgentState) -> AgentState:
             })
             break
 
-    react_latency = time.monotonic() - t_start   # 12장 avg latency 지표용
+    react_latency = time.monotonic() - t_start   # avg latency 지표용
 
     if final_args is None:
         if early_abstain:
@@ -498,7 +519,7 @@ def react_node(state: AgentState) -> AgentState:
             "evidence_strength": "LOW",
             "draft_opinion": abstain_draft,
             "recommendation": "ADDITIONAL_REVIEW_NEEDED",
-            # --- 12장 평가지표용 ---
+            # --- 평가지표용 ---
             "loop_completed": False,
             "hallucinated_case_ids": [],
             "not_reranked_case_ids": [],
@@ -555,10 +576,12 @@ def react_node(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# 결정론적 가드레일 노드 (LLM 재량 밖)
+# 규칙 기반 가드레일 노드 (LLM 재량 밖)
 # ---------------------------------------------------------------------------
 
 def risk_node(state: AgentState) -> AgentState:
+    """위험도 판정(규칙기반, LLM 재량 밖): 5개 조건 중 하나라도 해당하면
+    hitl_required=True. 자동 통과는 HIGH+APPROVE+웹검색 미사용의 교집합뿐."""
     reasons = []
     if not state["filtered_cases"] or state["evidence_strength"] == "LOW":
         reasons.append("유사 판례가 없거나 관련성이 낮음")
@@ -576,6 +599,8 @@ def risk_node(state: AgentState) -> AgentState:
 
 
 def hitl_node(state: AgentState) -> AgentState:
+    """승인 게이트: hitl_required면 LangGraph interrupt()로 실행을 일시정지하고
+    심사역의 ACCEPT/MODIFY/REJECT 입력을 대기. checkpointer가 상태를 보존해 재개."""
     if not state.get("hitl_required"):
         return {"human_decision": "AUTO_PASS", "human_note": None}
 
@@ -592,10 +617,12 @@ def hitl_node(state: AgentState) -> AgentState:
 
 
 def log_node(state: AgentState) -> AgentState:
+    """감사로그 강제 저장: 입력/출력/HITL 여부/승인 결과/평가지표 컬럼을
+    agent_audit_log에 기록. 12장 평가지표 6종은 이 테이블을 SQL 집계해 산출."""
     conn = get_conn()
     cur = conn.cursor()
 
-    # 12장 token cost 지표: 케이스당 예상 비용(USD) 계산
+    # token cost 지표: 케이스당 예상 비용(USD) 계산
     estimated_cost = (
         state.get("chat_input_tokens", 0) * CHAT_INPUT_RATE
         + state.get("chat_output_tokens", 0) * CHAT_OUTPUT_RATE
@@ -649,6 +676,8 @@ def log_node(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 def build_graph():
+    """그래프 조립: START→react→risk→hitl→log→END 일직선 강제 + MemorySaver
+    checkpointer(interrupt 멈춤-재개용, 메모리 기반이라 프로세스 생존 동안만 유지)."""
     graph = StateGraph(AgentState)
     graph.add_node("react", react_node)
     graph.add_node("risk", risk_node)
