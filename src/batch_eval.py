@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ClaimPrecedent 배치 평가 실행기 — 12장 평가지표 실측용
+ClaimPrecedent 배치 평가 실행기 — 평가지표 실측용
 테스트 질의를 순차 실행해 agent_audit_log에 로그를 쌓는다. 이후 metrics.sql로 집계.
 
 사용법:
@@ -39,6 +39,8 @@ DEFAULT_QUERIES = [
 
 
 def run_one(app, idx: int, query: str, auto_accept: bool):
+    """질의 1건 end-to-end 실행: 그래프 invoke → HITL 발동 시 판정(수동/자동) → 재개.
+    실행 결과는 log 노드가 agent_audit_log에 적재하므로 별도 저장 불필요."""
     config = {"configurable": {"thread_id": f"batch-{idx}-{int(time.time())}"}}
     print(f"\n[{idx}] {query[:60]}...")
     result = app.invoke({"input_query": query, "product_type": "실손의료보험"}, config=config)
