@@ -16,6 +16,7 @@ OUT = "/home/opc/cleaned_cases.csv"
 SECTION_NAMES = ["민원내용", "쟁점", "처리결과", "조정결과", "심사결과", "소비자유의사항", "결정이유"]
 END_MARKERS = ["목록", "정보관리 담당부서 안내", "담당부서"]
 
+# 공백·개행 정규화 및 크롤링 잔여 노이즈 제거
 def normalize_ws(text: str) -> str:
     """한 글자씩 개행된 텍스트를 자연스러운 문장으로 복원"""
     # 연속 개행/공백을 단일 공백으로
@@ -26,6 +27,7 @@ def normalize_ws(text: str) -> str:
     text = re.sub(r'\(\s+', '(', text)
     return text.strip()
 
+# 본문에서 '민원내용/쟁점/처리결과/소비자유의사항' 섹션을 라벨 기준으로 분리
 def parse_sections(raw: str):
     """▣ 마커 기준으로 섹션 분리 (원본 추출 과정에서 단어 사이 개행이 들어가는 경우가 있어
     섹션명 문자 사이에 임의 공백/개행이 끼어도 매칭되도록 문자 단위로 유연하게 패턴 구성)"""
@@ -46,6 +48,7 @@ def parse_sections(raw: str):
         sections[name] = normalize_ws(content)
     return sections
 
+# 임베딩 입력용 통합 텍스트 합성: 제목+유형+쟁점+처리결과를 하나의 case_text로
 def build_case_text(row, sections):
     """RAG 임베딩용 최종 텍스트 조립: 제목 + 유형 + 민원내용 + 쟁점 + 처리결과"""
     parts = [f"[{row['유형']}] {row['제목']}"]
@@ -62,6 +65,8 @@ def build_case_text(row, sections):
     return "\n".join(parts)
 
 def main():
+    """전처리 파이프라인: 원천 CSV → 섹션 파싱·정규화 → case_id(FSS-XXXX) 부여 →
+    임베딩용 case_text 합성 → cleaned_cases.csv 저장."""
     with open(SRC, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
