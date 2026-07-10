@@ -79,6 +79,7 @@ gpt-4o-mini를 선택한 이유: 산출물이 참고자료이고 HITL이 최종 
     ├── migrate_v3_external_references.sql
     ├── migrate_v4_metrics_columns.sql    # 평가지표 실측용 컬럼
     └── metrics.sql                       # 12장 평가지표 6종 집계 쿼리
+    └── app_ui.py                         # streamlit 웹 서버 구성
 ```
 
 ## 실행 방법
